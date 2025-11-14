@@ -760,3 +760,13 @@ model EvoaiSetting {
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
 }
+
+
+model LabelContact {
+  id         Int      @id @default(autoincrement())
+  labelId    Int
+  contactId  String
+  createdAt  DateTime @default(now())
+
+  @@unique([labelId, contactId])
+}
