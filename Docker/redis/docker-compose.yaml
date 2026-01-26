@@ -10,8 +10,11 @@ services:
       redis-server --port 6379 --appendonly yes
     volumes:
       - evolution_redis:/data
-    ports:
-      - 6379:6379
+    # NO exponer puerto 6379 públicamente (seguridad)
+    # Los contenedores en la red 'evolution-net' acceden usando: redis://redis:6379
+    # Si necesitas acceso desde el host para debugging, descomenta la línea siguiente:
+    # ports:
+    #   - "127.0.0.1:6379:6379"
 
 volumes:
   evolution_redis:
