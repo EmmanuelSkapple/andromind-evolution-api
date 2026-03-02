@@ -31,10 +31,14 @@ lerna-debug.log*
 /test/
 /store
 
-
 /temp/*
 
 .DS_Store
 *.DS_Store
 .tool-versions
+
+# Environment variables - NEVER commit secrets
+.env
+.env.local
+.env.*.local
 

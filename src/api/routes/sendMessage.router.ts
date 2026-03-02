@@ -30,10 +30,41 @@ import {
   templateMessageSchema,
   textMessageSchema,
 } from '@validate/validate.schema';
-import { RequestHandler, Router } from 'express';
+import { NextFunction, Request, RequestHandler, Response, Router } from 'express';
 import multer from 'multer';
 
 import { HttpStatus } from './index.router';
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30;
+
+const rateLimitStore = new Map<string, { count: number; windowStart: number }>();
+
+function messageSendRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const instanceName = req.params.instanceName ?? 'unknown';
+  const now = Date.now();
+  const entry = rateLimitStore.get(instanceName);
+
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitStore.set(instanceName, { count: 1, windowStart: now });
+    return next();
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX) {
+    const retryAfter = Math.ceil((RATE_LIMIT_WINDOW_MS - (now - entry.windowStart)) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    res.status(429).json({
+      status: 429,
+      error: 'Too Many Requests',
+      message: `Rate limit exceeded: max ${RATE_LIMIT_MAX} messages per minute per instance.`,
+      retryAfterSeconds: retryAfter,
+    });
+    return;
+  }
+
+  entry.count++;
+  return next();
+}
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -41,7 +72,7 @@ export class MessageRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
-      .post(this.routerPath('sendTemplate'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendTemplate'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendTemplateDto>({
           request: req,
           schema: templateMessageSchema,
@@ -51,7 +82,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendText'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendText'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendTextDto>({
           request: req,
           schema: textMessageSchema,
@@ -61,7 +92,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendMedia'), ...guards, upload.single('file'), async (req, res) => {
+      .post(this.routerPath('sendMedia'), ...guards, messageSendRateLimit, upload.single('file'), async (req, res) => {
         const bodyData = req.body;
 
         const response = await this.dataValidate<SendMediaDto>({
@@ -73,7 +104,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendPtv'), ...guards, upload.single('file'), async (req, res) => {
+      .post(this.routerPath('sendPtv'), ...guards, messageSendRateLimit, upload.single('file'), async (req, res) => {
         const bodyData = req.body;
 
         const response = await this.dataValidate<SendPtvDto>({
@@ -85,20 +116,26 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendWhatsAppAudio'), ...guards, upload.single('file'), async (req, res) => {
-        const bodyData = req.body;
+      .post(
+        this.routerPath('sendWhatsAppAudio'),
+        ...guards,
+        messageSendRateLimit,
+        upload.single('file'),
+        async (req, res) => {
+          const bodyData = req.body;
 
-        const response = await this.dataValidate<SendAudioDto>({
-          request: req,
-          schema: audioMessageSchema,
-          ClassRef: SendMediaDto,
-          execute: (instance) => sendMessageController.sendWhatsAppAudio(instance, bodyData, req.file as any),
-        });
+          const response = await this.dataValidate<SendAudioDto>({
+            request: req,
+            schema: audioMessageSchema,
+            ClassRef: SendMediaDto,
+            execute: (instance) => sendMessageController.sendWhatsAppAudio(instance, bodyData, req.file as any),
+          });
 
-        return res.status(HttpStatus.CREATED).json(response);
-      })
+          return res.status(HttpStatus.CREATED).json(response);
+        },
+      )
       // TODO: Revisar funcionamento do envio de Status
-      .post(this.routerPath('sendStatus'), ...guards, upload.single('file'), async (req, res) => {
+      .post(this.routerPath('sendStatus'), ...guards, messageSendRateLimit, upload.single('file'), async (req, res) => {
         const bodyData = req.body;
 
         const response = await this.dataValidate<SendStatusDto>({
@@ -110,19 +147,25 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendSticker'), ...guards, upload.single('file'), async (req, res) => {
-        const bodyData = req.body;
+      .post(
+        this.routerPath('sendSticker'),
+        ...guards,
+        messageSendRateLimit,
+        upload.single('file'),
+        async (req, res) => {
+          const bodyData = req.body;
 
-        const response = await this.dataValidate<SendStickerDto>({
-          request: req,
-          schema: stickerMessageSchema,
-          ClassRef: SendStickerDto,
-          execute: (instance) => sendMessageController.sendSticker(instance, bodyData, req.file as any),
-        });
+          const response = await this.dataValidate<SendStickerDto>({
+            request: req,
+            schema: stickerMessageSchema,
+            ClassRef: SendStickerDto,
+            execute: (instance) => sendMessageController.sendSticker(instance, bodyData, req.file as any),
+          });
 
-        return res.status(HttpStatus.CREATED).json(response);
-      })
-      .post(this.routerPath('sendLocation'), ...guards, async (req, res) => {
+          return res.status(HttpStatus.CREATED).json(response);
+        },
+      )
+      .post(this.routerPath('sendLocation'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendLocationDto>({
           request: req,
           schema: locationMessageSchema,
@@ -132,7 +175,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendContact'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendContact'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendContactDto>({
           request: req,
           schema: contactMessageSchema,
@@ -142,7 +185,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendReaction'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendReaction'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendReactionDto>({
           request: req,
           schema: reactionMessageSchema,
@@ -152,7 +195,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendPoll'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendPoll'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendPollDto>({
           request: req,
           schema: pollMessageSchema,
@@ -162,7 +205,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendList'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendList'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendListDto>({
           request: req,
           schema: listMessageSchema,
@@ -172,7 +215,7 @@ export class MessageRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
-      .post(this.routerPath('sendButtons'), ...guards, async (req, res) => {
+      .post(this.routerPath('sendButtons'), ...guards, messageSendRateLimit, async (req, res) => {
         const response = await this.dataValidate<SendButtonsDto>({
           request: req,
           schema: buttonsMessageSchema,

@@ -248,9 +248,46 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
 
+  // Reconnection management
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private reconnectDelay = 5000; // Initial delay in milliseconds (5 seconds)
+  private maxReconnectDelay = 300000; // Maximum delay in milliseconds (5 minutes)
+  private isReconnecting = false;
+  private lastReconnectTime = 0;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+
+  // readMessages throttle — batch up to 10 keys every 500ms to avoid flooding WhatsApp
+  private readonly READ_MSG_BATCH_SIZE = 10;
+  private readonly READ_MSG_FLUSH_INTERVAL_MS = 500;
+  private readMessageQueue: proto.IMessageKey[] = [];
+  private readMessageTimer: NodeJS.Timeout | null = null;
+
+  private queueReadMessage(key: proto.IMessageKey): void {
+    this.readMessageQueue.push(key);
+    if (this.readMessageQueue.length >= this.READ_MSG_BATCH_SIZE) {
+      this.flushReadMessageQueue();
+      return;
+    }
+    if (!this.readMessageTimer) {
+      this.readMessageTimer = setTimeout(() => this.flushReadMessageQueue(), this.READ_MSG_FLUSH_INTERVAL_MS);
+    }
+  }
+
+  private flushReadMessageQueue(): void {
+    if (this.readMessageTimer) {
+      clearTimeout(this.readMessageTimer);
+      this.readMessageTimer = null;
+    }
+    if (this.readMessageQueue.length === 0) return;
+    const keys = this.readMessageQueue.splice(0, this.readMessageQueue.length);
+    this.client?.readMessages(keys).catch((err) => {
+      this.logger.warn(`readMessages batch failed: ${err?.message}`);
+    });
+  }
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -401,8 +438,78 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        // Reset reconnect attempts if connection was open for more than 5 minutes
+        const timeSinceLastReconnect = Date.now() - this.lastReconnectTime;
+        if (timeSinceLastReconnect > 300000) {
+          // 5 minutes
+          this.reconnectAttempts = 0;
+        }
+
+        // Check if we should attempt reconnection
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          this.logger.error(
+            `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached for instance ${this.instance.name}. Stopping reconnection attempts.`,
+          );
+          this.sendDataWebhook(Events.STATUS_INSTANCE, {
+            instance: this.instance.name,
+            status: 'closed',
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: statusCode,
+            disconnectionObject: JSON.stringify(lastDisconnect),
+            message: 'Maximum reconnect attempts reached',
+          });
+          return;
+        }
+
+        // Prevent multiple simultaneous reconnection attempts
+        if (this.isReconnecting) {
+          this.logger.warn(
+            `Reconnection already in progress for instance ${this.instance.name}. Skipping duplicate reconnection attempt.`,
+          );
+          return;
+        }
+
+        this.isReconnecting = true;
+        this.reconnectAttempts++;
+        this.lastReconnectTime = Date.now();
+
+        // Calculate delay with exponential backoff
+        // For 503 errors (service unavailable), use longer delays
+        const isServiceUnavailable = statusCode === 503 || statusCode === DisconnectReason.connectionClosed;
+        const baseDelay = isServiceUnavailable ? this.reconnectDelay * 2 : this.reconnectDelay;
+        const exponentialDelay = baseDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 6)); // Max 2^6 = 64x
+        const delay = Math.min(exponentialDelay, this.maxReconnectDelay);
+
+        // Add jitter to prevent thundering herd
+        const jitter = delay * 0.1 * (Math.random() * 2 - 1); // ±10% jitter
+        const finalDelay = Math.max(1000, delay + jitter); // Minimum 1 second
+
+        this.logger.warn(
+          `Connection closed for instance ${this.instance.name}. Status code: ${statusCode}. Scheduling reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${Math.round(finalDelay / 1000)} seconds.`,
+        );
+
+        // Schedule reconnection with delay
+        setTimeout(async () => {
+          try {
+            this.logger.info(
+              `Attempting to reconnect instance ${this.instance.name} (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+            );
+            await this.connectToWhatsapp(this.phoneNumber);
+            // Reset attempts on successful connection
+            this.reconnectAttempts = 0;
+            this.isReconnecting = false;
+          } catch (error) {
+            this.logger.error({
+              local: 'BaileysStartupService.connectionUpdate',
+              message: `Reconnection attempt ${this.reconnectAttempts} failed for instance ${this.instance.name}`,
+              error: error?.message || error,
+            });
+            this.isReconnecting = false;
+            // The connectionUpdate will be called again with 'close' status, triggering another reconnection attempt
+          }
+        }, finalDelay);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -439,6 +546,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      // Reset reconnect attempts on successful connection
+      this.reconnectAttempts = 0;
+      this.isReconnecting = false;
+      this.lastReconnectTime = Date.now();
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -632,8 +744,8 @@ export class BaileysStartupService extends ChannelStartupService {
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
-      retryRequestDelayMs: 350,
-      maxMsgRetryCount: 4,
+      retryRequestDelayMs: 1000,
+      maxMsgRetryCount: 2,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
       keepAliveIntervalMs: 30_000,
@@ -821,14 +933,41 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
-          })),
-        );
+        const BATCH_SIZE = 5;
+        const BATCH_DELAY_MS = 1000;
+        const updatedContacts: {
+          remoteJid: string;
+          pushName: string;
+          profilePicUrl: string | undefined;
+          instanceId: string;
+        }[] = [];
+
+        for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+          const batch = contacts.slice(i, i + BATCH_SIZE);
+          const batchResults = await Promise.all(
+            batch.map(async (contact) => {
+              try {
+                return {
+                  remoteJid: contact.id,
+                  pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+                  profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+                  instanceId: this.instanceId,
+                };
+              } catch {
+                return {
+                  remoteJid: contact.id,
+                  pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+                  profilePicUrl: undefined,
+                  instanceId: this.instanceId,
+                };
+              }
+            }),
+          );
+          updatedContacts.push(...batchResults);
+          if (i + BATCH_SIZE < contacts.length) {
+            await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
+          }
+        }
 
         if (updatedContacts.length > 0) {
           const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
@@ -1197,11 +1336,11 @@ export class BaileysStartupService extends ChannelStartupService {
           const isVideo = received?.message?.videoMessage;
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
-            await this.client.readMessages([received.key]);
+            this.queueReadMessage(received.key);
           }
 
           if (this.localSettings.readStatus && received.key.id === 'status@broadcast') {
-            await this.client.readMessages([received.key]);
+            this.queueReadMessage(received.key);
           }
 
           if (
@@ -1915,7 +2054,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       if (number) {
-        const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
+        const info = onWhatsapp;
         const picture = await this.profilePicture(info?.jid);
         const status = await this.getStatus(info?.jid);
         const business = await this.fetchBusinessProfile(info?.jid);
@@ -2144,9 +2283,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       if (options?.delay) {
-        this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
-        if (options.delay > 20000) {
-          let remainingDelay = options.delay;
+        const MAX_TYPING_DELAY_MS = 60_000;
+        const clampedDelay = Math.min(options.delay, MAX_TYPING_DELAY_MS);
+        this.logger.verbose(`Typing for ${clampedDelay}ms to ${sender}`);
+        if (clampedDelay > 20000) {
+          let remainingDelay = clampedDelay;
           while (remainingDelay > 20000) {
             await this.client.presenceSubscribe(sender);
 
@@ -2172,7 +2313,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
 
-          await delay(options.delay);
+          await delay(clampedDelay);
 
           await this.client.sendPresenceUpdate('paused', sender);
         }
@@ -4346,6 +4487,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       for await (const number of numbers) {
         await this.sendMessageWithTyping(number, message);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
       }
 
       return { send: true, inviteUrl };
