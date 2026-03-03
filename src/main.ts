@@ -51,9 +51,14 @@ async function bootstrap() {
         if (ORIGIN.includes('*')) {
           return callback(null, true);
         }
+        // Allow requests with no origin (server-to-server, curl, mobile apps)
+        if (!requestOrigin) {
+          return callback(null, true);
+        }
         if (ORIGIN.indexOf(requestOrigin) !== -1) {
           return callback(null, true);
         }
+        logger.warn(`CORS blocked origin: "${requestOrigin}" — allowed: ${ORIGIN.join(', ')}`);
         return callback(new Error('Not allowed by CORS'));
       },
       methods: [...configService.get<Cors>('CORS').METHODS],
