@@ -75,6 +75,18 @@ async function bootstrap() {
   app.use(
     (err: Error, req: Request, res: Response, next: NextFunction) => {
       if (err) {
+        const status = err['status'] || 500;
+
+        // Always log errors so they appear in PM2 logs
+        logger.error({
+          status,
+          method: req.method,
+          url: req.originalUrl,
+          error: err['error'] || 'Internal Server Error',
+          message: err.message,
+          stack: status === 500 ? err.stack : undefined,
+        });
+
         const webhook = configService.get<Webhook>('WEBHOOK');
 
         if (webhook.EVENTS.ERRORS_WEBHOOK && webhook.EVENTS.ERRORS_WEBHOOK != '' && webhook.EVENTS.ERRORS) {
@@ -89,7 +101,7 @@ async function bootstrap() {
             data: {
               error: err['error'] || 'Internal Server Error',
               message: err['message'] || 'Internal Server Error',
-              status: err['status'] || 500,
+              status,
               response: {
                 message: err['message'] || 'Internal Server Error',
               },
@@ -99,16 +111,14 @@ async function bootstrap() {
             server_url: serverUrl,
           };
 
-          logger.error(errorData);
-
           const baseURL = webhook.EVENTS.ERRORS_WEBHOOK;
           const httpService = axios.create({ baseURL });
 
           httpService.post('', errorData);
         }
 
-        return res.status(err['status'] || 500).json({
-          status: err['status'] || 500,
+        return res.status(status).json({
+          status,
           error: err['error'] || 'Internal Server Error',
           response: {
             message: err['message'] || 'Internal Server Error',
