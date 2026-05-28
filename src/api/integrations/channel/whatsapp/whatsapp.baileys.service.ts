@@ -140,7 +140,9 @@ import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
-import { release } from 'os';
+// 'release' eliminado: usábamos os.release() como version del browser, lo que filtraba
+// la versión del kernel de Linux al servidor de WhatsApp (muy sospechoso).
+// Ahora se usa una versión fija de macOS Catalina, idéntica a Browsers.macOS('Chrome') de Baileys.
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
@@ -250,11 +252,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // Reconnection management
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
-  private reconnectDelay = 5000; // Initial delay in milliseconds (5 seconds)
-  private maxReconnectDelay = 300000; // Maximum delay in milliseconds (5 minutes)
+  // Sin límite fijo de intentos: después de agotar el ciclo, espera y reintenta indefinidamente.
+  // maxReconnectAttempts es el tamaño del ciclo, NO un límite permanente.
+  private readonly maxReconnectAttempts = 20;
+  private readonly reconnectDelay = 3000; // delay base: 3 s (antes 5 s)
+  private readonly maxReconnectDelay = 120000; // tope por intento: 2 min (antes 5 min)
+  // Después de agotar maxReconnectAttempts, espera LONG_RETRY_DELAY antes de reiniciar el ciclo
+  private readonly longRetryDelayMs = 30 * 60 * 1000; // 30 minutos
   private isReconnecting = false;
-  private lastReconnectTime = 0;
+  private lastConnectionOpenTime = 0; // cuándo se abrió la conexión exitosamente (no cuándo se intentó)
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -436,78 +442,85 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+
+      // Códigos donde NO tiene sentido reconectar (sesión cerrada por WhatsApp explícitamente).
+      // 440 (connectionReplaced) se excluye de aquí: si el doctor abre WA Web manualmente
+      // podemos intentar recuperar la sesión cuando él cierre el navegador.
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
       if (shouldReconnect) {
-        // Reset reconnect attempts if connection was open for more than 5 minutes
-        const timeSinceLastReconnect = Date.now() - this.lastReconnectTime;
-        if (timeSinceLastReconnect > 300000) {
-          // 5 minutes
+        // Si la última conexión exitosa duró más de 1 minuto, el problema es transitorio
+        // → resetear el contador de intentos para tener el ciclo completo disponible.
+        // (Usamos lastConnectionOpenTime, no lastReconnectTime, para evitar el bug donde
+        //  el timestamp se sobreescribía al iniciar cada intento.)
+        const stableConnectionTime = Date.now() - this.lastConnectionOpenTime;
+        if (stableConnectionTime > 60_000) {
           this.reconnectAttempts = 0;
         }
 
-        // Check if we should attempt reconnection
-        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-          this.logger.error(
-            `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached for instance ${this.instance.name}. Stopping reconnection attempts.`,
-          );
-          this.sendDataWebhook(Events.STATUS_INSTANCE, {
-            instance: this.instance.name,
-            status: 'closed',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-            message: 'Maximum reconnect attempts reached',
-          });
-          return;
-        }
-
-        // Prevent multiple simultaneous reconnection attempts
+        // Prevenir intentos simultáneos
         if (this.isReconnecting) {
-          this.logger.warn(
-            `Reconnection already in progress for instance ${this.instance.name}. Skipping duplicate reconnection attempt.`,
-          );
+          this.logger.warn(`Reconexión ya en curso para ${this.instance.name}. Ignorando intento duplicado.`);
           return;
         }
 
         this.isReconnecting = true;
         this.reconnectAttempts++;
-        this.lastReconnectTime = Date.now();
 
-        // Calculate delay with exponential backoff
-        // For 503 errors (service unavailable), use longer delays
-        const isServiceUnavailable = statusCode === 503 || statusCode === DisconnectReason.connectionClosed;
-        const baseDelay = isServiceUnavailable ? this.reconnectDelay * 2 : this.reconnectDelay;
-        const exponentialDelay = baseDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 6)); // Max 2^6 = 64x
-        const delay = Math.min(exponentialDelay, this.maxReconnectDelay);
+        // ── Calcular delay según el código de desconexión ──────────────────────
+        let finalDelay: number;
 
-        // Add jitter to prevent thundering herd
-        const jitter = delay * 0.1 * (Math.random() * 2 - 1); // ±10% jitter
-        const finalDelay = Math.max(1000, delay + jitter); // Minimum 1 second
+        if (statusCode === DisconnectReason.restartRequired) {
+          // 515: WhatsApp pide reiniciar. Reconectar casi de inmediato (1-2 s).
+          finalDelay = 1500 + Math.random() * 500;
+          this.logger.info(
+            `[${this.instance.name}] WA solicitó reinicio (515). Reconectando en ${Math.round(finalDelay / 1000)}s.`,
+          );
+        } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          // Ciclo de intentos agotado. En lugar de morir para siempre, esperar
+          // un tiempo largo y reiniciar el ciclo completo.
+          this.reconnectAttempts = 0;
+          finalDelay = this.longRetryDelayMs;
+          this.logger.warn(
+            `[${this.instance.name}] ${this.maxReconnectAttempts} intentos agotados. ` +
+              `Reintentando en ${Math.round(finalDelay / 60000)} minutos (ciclo reiniciado).`,
+          );
+          this.sendDataWebhook(Events.STATUS_INSTANCE, {
+            instance: this.instance.name,
+            status: 'waiting_reconnect',
+            disconnectionReasonCode: statusCode,
+            message: `Intentos de reconexión agotados. Próximo intento en ${Math.round(finalDelay / 60000)} min.`,
+          });
+        } else {
+          // Backoff exponencial normal con jitter ±10%
+          const isServiceUnavailable = statusCode === 503 || statusCode === DisconnectReason.connectionClosed;
+          const baseDelay = isServiceUnavailable ? this.reconnectDelay * 2 : this.reconnectDelay;
+          const exponentialDelay = baseDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)); // tope en 2^5 = 32x
+          const cappedDelay = Math.min(exponentialDelay, this.maxReconnectDelay);
+          const jitter = cappedDelay * 0.1 * (Math.random() * 2 - 1);
+          finalDelay = Math.max(1500, cappedDelay + jitter);
 
-        this.logger.warn(
-          `Connection closed for instance ${this.instance.name}. Status code: ${statusCode}. Scheduling reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${Math.round(finalDelay / 1000)} seconds.`,
-        );
+          this.logger.warn(
+            `[${this.instance.name}] Conexión cerrada (código ${statusCode}). ` +
+              `Intento ${this.reconnectAttempts}/${this.maxReconnectAttempts} en ${Math.round(finalDelay / 1000)}s.`,
+          );
+        }
 
-        // Schedule reconnection with delay
         setTimeout(async () => {
           try {
-            this.logger.info(
-              `Attempting to reconnect instance ${this.instance.name} (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
-            );
+            this.logger.info(`[${this.instance.name}] Intentando reconectar...`);
             await this.connectToWhatsapp(this.phoneNumber);
-            // Reset attempts on successful connection
-            this.reconnectAttempts = 0;
+            // El reset de reconnectAttempts ocurre en el bloque 'open' abajo
             this.isReconnecting = false;
           } catch (error) {
             this.logger.error({
               local: 'BaileysStartupService.connectionUpdate',
-              message: `Reconnection attempt ${this.reconnectAttempts} failed for instance ${this.instance.name}`,
+              message: `Intento de reconexión ${this.reconnectAttempts} fallido para ${this.instance.name}`,
               error: error?.message || error,
             });
             this.isReconnecting = false;
-            // The connectionUpdate will be called again with 'close' status, triggering another reconnection attempt
+            // connectionUpdate se llamará de nuevo con 'close', disparando otro intento
           }
         }, finalDelay);
       } else {
@@ -546,10 +559,12 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
-      // Reset reconnect attempts on successful connection
+      // Conexión exitosa: resetear contador y registrar timestamp de apertura.
+      // lastConnectionOpenTime se usa (no lastReconnectTime) para saber cuánto
+      // tiempo estuvo estable la conexión antes de caer.
       this.reconnectAttempts = 0;
       this.isReconnecting = false;
-      this.lastReconnectTime = Date.now();
+      this.lastConnectionOpenTime = Date.now();
 
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
@@ -671,7 +686,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.info(`Phone number: ${number}`);
     } else {
-      const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
+      // Versión de macOS Catalina — idéntica a Browsers.macOS('Chrome') de Baileys.
+      // Evita filtrar la versión del kernel Linux como si fuera una versión de browser.
+      const browser: WABrowserDescription = [session.CLIENT, session.NAME, '10_15_7'];
       browserOptions = { browser };
 
       this.logger.info(`Browser: ${browser}`);
@@ -744,11 +761,11 @@ export class BaileysStartupService extends ChannelStartupService {
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
-      retryRequestDelayMs: 1000,
-      maxMsgRetryCount: 2,
+      retryRequestDelayMs: 2000, // más tolerante a latencia en DigitalOcean
+      maxMsgRetryCount: 3, // un reintento más antes de descartar
       fireInitQueries: true,
-      connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
+      connectTimeoutMs: 60_000, // 60 s (antes 30): evita falsos timeouts en red lenta
+      keepAliveIntervalMs: 25_000, // 25 s: mantiene el WS vivo sin saturar la conexión
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
